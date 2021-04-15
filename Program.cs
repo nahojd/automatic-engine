@@ -6,7 +6,6 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.RegularExpressions;
-using System.Threading;
 using System.Threading.Tasks;
 using Spectre.Console;
 
@@ -24,24 +23,35 @@ namespace sorteraochfixa
 			var unpack = args.Any(x => x.Equals("--unpack", StringComparison.InvariantCultureIgnoreCase));
 			var useFilter = args.Any(x => x.Equals("--filter", StringComparison.InvariantCultureIgnoreCase));
 			var dryrun = args.Any(x => x.Equals("--dryrun", StringComparison.InvariantCultureIgnoreCase));
+			var includeFolders = args.Any(x => x.Equals("--folders", StringComparison.InvariantCultureIgnoreCase));
+			var flattenSubdirs = args.Any(x => x.Equals("--flatten", StringComparison.InvariantCultureIgnoreCase));
 
-			List<FileInfo> files = null;
+			List<FileSystemInfo> fsItems = null;
+			// List<DirectoryInfo> dirs = null;
 			AnsiConsole.Status()
 				.Start($"Reading files from [bold]{src.Replace("[", "[[").Replace("]", "]]")}[/]", ctx => {
 					ctx.Spinner(Spinner.Known.Dots);
 					var srcDir = new DirectoryInfo(src);
-					files = srcDir
-							.GetFiles()
-							.Where(f => !useFilter || !Filter.IsMatch(f.Name))
-							.OrderBy(x => x.Name)
-							.ToList();
+					if (!includeFolders)
+						fsItems = srcDir
+								.GetFiles()
+								.Select(x => x as FileSystemInfo)
+								.Where(f => !useFilter || !Filter.IsMatch(f.Name))
+								.OrderBy(x => x.Name)
+								.ToList();
+					else
+						fsItems = srcDir
+								.GetFileSystemInfos()
+								.Select(x => x as FileSystemInfo)
+								.Where(f => !useFilter || !Filter.IsMatch(f.Name))
+								.OrderBy(x => x.Name)
+								.ToList();
 				});
 
-			AnsiConsole.MarkupLine($"Found [green]{files.Count}[/] files in [bold]{src.Replace("[", "[[").Replace("]", "]]")}[/].");
+			AnsiConsole.MarkupLine($"Found [green]{fsItems.Count}[/] files in [bold]{src.Replace("[", "[[").Replace("]", "]]")}[/].");
 
-			var processed = 0;
 			var duplicates = 0;
-			var useSubFolders = !noSplit && files.Count > 200;
+			var useSubFolders = !noSplit && fsItems.Count > 200;
 
 			AnsiConsole.Progress()
 				.AutoClear(false)
@@ -53,45 +63,31 @@ namespace sorteraochfixa
 					new SpinnerColumn(),            // Spinner
 				})
 				.Start(ctx => {
-					var task1 = ctx.AddTask("Removing duplicates");
-					var task3 = ctx.AddTask($"Copying files to [bold]{dest}[/]", new ProgressTaskSettings { AutoStart = false });
+					var task1 = ctx.AddTask("Removing duplicates", new ProgressTaskSettings { MaxValue = fsItems.Count });
 
-					var uniqueFiles = new ConcurrentBag<FileInfo>();
+					var uniqueFiles = new ConcurrentBag<FileSystemInfo>();
 
-					Parallel.For(0, files.Count, (index, state) =>
-					{
-						//var pct = index / files.Count * 100
-						//Console.Write(file.Name);
-						var file = files[index];
-						var relevantName = RelevantName(file.Name);
-						var isDuplicate = files.Take(index).Any(x => RelevantName(x.Name).Equals(relevantName, StringComparison.InvariantCultureIgnoreCase));
-						if (isDuplicate) {
-							//Console.Write(" (duplicate)");
-							duplicates++;
-						}
-						else
-							uniqueFiles.Add(file);
+					Parallel.ForEach(fsItems.GroupBy(x => x.Name[0]), (itemsByFirstLetter, _, _) => {
+						Parallel.ForEach(itemsByFirstLetter, (file, state, index) =>
+						{
+							var relevantName = RelevantName(file.Name);
+							var isDuplicate = itemsByFirstLetter.Take((int)index).Any(x => RelevantName(x.Name).Equals(relevantName, StringComparison.InvariantCultureIgnoreCase));
+							if (isDuplicate) {
+								duplicates++;
+							}
+							else
+								uniqueFiles.Add(file);
 
-						Interlocked.Increment(ref processed);
-
-						//Update progress -- not worth locking for
-						var pct = processed*100/files.Count;
-						var diff = pct - task1.Percentage;
-						if (diff > 0)
-							task1.Increment(diff);
+							task1.Increment(1);
+						});
 					});
 
-					if (task1.Percentage < 100)
-					{
-						task1.Increment(100-task1.Percentage);
-						task1.StopTask();
-					}
+					task1.StopTask();
 
-					processed = 0; //Starta om räknaren
-					task3.Description = $"{(unpack ? "Unpacking" : "Copying")} {uniqueFiles.Count-processed} files to [bold]{dest}[/]";
+					var task3 = ctx.AddTask($"Copying files to [bold]{dest}[/]", new ProgressTaskSettings { AutoStart = false, MaxValue = uniqueFiles.Count });
+					task3.Description = $"{(unpack ? "Unpacking" : "Copying")} {uniqueFiles.Count} files to [bold]{dest}[/]";
 					task3.StartTask();
 					foreach(var file in uniqueFiles) {
-						//TODO: Gruppa 0-9 som 9
 						var destination = dest;
 						if (useSubFolders) {
 							var group = Words.Match(file.Name).Value.ToUpperInvariant();
@@ -105,25 +101,28 @@ namespace sorteraochfixa
 							if (!Directory.Exists(destination))
 								Directory.CreateDirectory(destination);
 
-							if (!unpack)
-								file.CopyTo(Path.Combine(destination, file.Name), true);
+							if (!unpack) {
+								if (file is FileInfo f)
+									f.CopyTo(Path.Combine(destination, file.Name), true);
+								else if (file is DirectoryInfo d) {
+									if (!flattenSubdirs)
+										destination = Directory.CreateDirectory(Path.Combine(destination, d.Name)).FullName;
+									foreach(var fileInDir in d.GetFiles())
+										fileInDir.CopyTo(Path.Combine(destination, fileInDir.Name));
+								}
+							}
 							else
 								ZipFile.ExtractToDirectory(file.FullName, destination, true);
 						}
 
-
-						Interlocked.Increment(ref processed);
-						var pct = processed*100/uniqueFiles.Count;
-						var diff = pct - task3.Percentage;
-						if (diff > 0)
-							task3.Increment(diff);
+						task3.Increment(1);
 					}
 
 				});
 
 			timer.Stop();
 
-			AnsiConsole.MarkupLine($"Found [red]{duplicates}[/] duplicates in [green]{files.Count}[/] files");
+			AnsiConsole.MarkupLine($"Found [red]{duplicates}[/] duplicates in [green]{fsItems.Count}[/] files");
 			AnsiConsole.MarkupLine($"Time elapsed: [bold]{timer.Elapsed} [/]seconds");
 		}
 
